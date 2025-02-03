@@ -99,7 +99,7 @@ class MainWindow(QMainWindow):
                     fp.write(rp.read())
         else:
             api_json = json.loads(open('config.json', 'r').read())
-            api_key = api_json['api_key']
+            api_key = api_json['api_key']['deepseek']
 
         if (not api_key) or api_key == "YOUR_API_KEY":
             QMessageBox.warning(self, "警告", "未找到 DEEPSEEK_API_KEY 环境变量，论文分析功能将不可用")
@@ -243,7 +243,7 @@ class MainWindow(QMainWindow):
         current_section = paper_sections[paper_index + 1]
         current_section = current_section.replace("等待分析...", "")
         current_section = current_section.replace("正在分析论文...", "")
-        current_section += f"DeepSeek 分析:{result.strip()}\n\n"
+        current_section += f"DeepSeek 分析:\n{result.strip()}\n\n"
 
         # 重建完整文本
         paper_sections[paper_index + 1] = current_section
