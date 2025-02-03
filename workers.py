@@ -28,22 +28,33 @@ class AnalysisWorker(QThread):
     """后台分析线程"""
     finished = pyqtSignal(str, int)
     error = pyqtSignal(str)
+    status_update = pyqtSignal(str)  # 新增状态更新信号
 
     def __init__(self, api, abstract: str, paper_index: int):
         super().__init__()
         self.api = api
         self.abstract = abstract
         self.paper_index = paper_index
-        self._is_running = True  # 使用私有变量跟踪运行状态
+        self._is_running = True
+
+    def status_callback(self, message: str):
+        """处理API的状态更新"""
+        if self._is_running:
+            self.status_update.emit(message)
 
     def run(self):
         try:
-            # 检查线程是否应该继续运行
             if self._is_running and self.api:
-                result = self.api.process_abstract(self.abstract)
-                # 再次检查,确保结果返回时线程仍应该运行
+                # 使用状态回调处理API调用
+                result = self.api.process_abstract(
+                    self.abstract,
+                    status_callback=self.status_callback
+                )
                 if self._is_running:
                     self.finished.emit(result, self.paper_index)
+        except TimeoutError as e:
+            if self._is_running:
+                self.error.emit(f"分析超时: {str(e)}")
         except Exception as e:
             if self._is_running:
                 self.error.emit(str(e))
@@ -51,7 +62,7 @@ class AnalysisWorker(QThread):
     def stop(self):
         """安全地停止线程"""
         self._is_running = False
-        self.wait()  # 等待线程完成当前操作
+        self.wait()
 
 
 class DownloadWorker(QThread):

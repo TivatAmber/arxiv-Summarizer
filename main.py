@@ -254,39 +254,35 @@ class MainWindow(QMainWindow):
 
     def process_analysis_queue(self):
         """处理分析队列"""
-        # 如果已经在分析或队列为空,直接返回
         if not self.analysis_queue or self.is_analyzing:
             return
 
-        # 设置分析状态
         self.is_analyzing = True
 
         try:
-            paper, index = self.analysis_queue[0]  # 只查看队列头部,暂时不移除
+            paper, index = self.analysis_queue[0]
 
-            # 确保索引有效且UI组件存在
             if index not in self.paper_tabs:
-                self.analysis_queue.pop(0)  # 移除无效的分析请求
+                self.analysis_queue.pop(0)
                 self.is_analyzing = False
                 return
 
-            # 更新UI显示分析状态
             paper_tab = self.paper_tabs[index]
-            paper_tab.analysis_text.setPlainText("正在分析论文...")
+            paper_tab.analysis_text.setPlainText("正在准备分析论文...")
 
             # 创建并配置分析线程
             analysis_worker = AnalysisWorker(self.deepseek, paper.abstract, index)
             analysis_worker.finished.connect(self.handle_analysis_result)
             analysis_worker.error.connect(self.handle_analysis_error)
+            # 连接状态更新信号
+            analysis_worker.status_update.connect(
+                lambda msg, tab=paper_tab: tab.analysis_text.setPlainText(msg)
+            )
 
-            # 将线程添加到活动线程列表
             self.active_threads.append(analysis_worker)
-
-            # 启动线程
             analysis_worker.start()
 
         except Exception as e:
-            # 发生错误时确保状态被重置
             self.is_analyzing = False
             self.statusBar().showMessage(f'分析过程出错: {str(e)}')
 
