@@ -1,83 +1,16 @@
+import json
 import os
 import sys
-from PyQt6.QtCore import QThread, pyqtSignal, QTimer
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                             QHBoxLayout, QLineEdit, QPushButton, QTextEdit,
-                             QLabel, QComboBox, QSpinBox, QProgressBar, QFileDialog,
-                             QMessageBox)
 
+from PyQt6.QtCore import QTimer
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QLineEdit, QPushButton, QLabel, QComboBox, QSpinBox, QProgressBar,
+                             QFileDialog,
+                             QMessageBox, QTabWidget)
 from arxiv_api import ArxivAPI, ArxivPaper
 from deepseek_api import DeepSeekAPI
-import json
-
-
-class SearchWorker(QThread):
-    """后台搜索线程"""
-    finished = pyqtSignal(list)
-    error = pyqtSignal(str)
-
-    def __init__(self, api, search_params):
-        super().__init__()
-        self.api = api
-        self.search_params = search_params
-        self.is_running = True
-
-    def run(self):
-        try:
-            if self.is_running:
-                results = self.api.search(**self.search_params)
-                self.finished.emit(results)
-        except Exception as e:
-            self.error.emit(str(e))
-
-    def stop(self):
-        self.is_running = False
-
-
-
-class AnalysisWorker(QThread):
-    """后台分析线程"""
-    finished = pyqtSignal(str, int)
-    error = pyqtSignal(str)
-
-    def __init__(self, api, abstract: str, paper_index: int):
-        super().__init__()
-        self.api = api
-        self.abstract = abstract
-        self.paper_index = paper_index
-        self.is_running = True
-
-    def run(self):
-        try:
-            if self.is_running:
-                result = self.api.process_abstract(self.abstract)
-                self.finished.emit(result, self.paper_index)
-        except Exception as e:
-            if self.is_running:
-                self.error.emit(str(e))
-
-    def stop(self):
-        self.is_running = False
-
-
-class DownloadWorker(QThread):
-    """后台下载线程"""
-    progress = pyqtSignal(int)
-    finished = pyqtSignal(bool)
-    error = pyqtSignal(str)
-
-    def __init__(self, api, paper, save_path):
-        super().__init__()
-        self.api = api
-        self.paper = paper
-        self.save_path = save_path
-
-    def run(self):
-        try:
-            success = self.api.download_paper(self.paper, self.save_path)
-            self.finished.emit(success)
-        except Exception as e:
-            self.error.emit(str(e))
+from paper_tab import PaperTab
+from workers import SearchWorker, AnalysisWorker, DownloadWorker
 
 
 class MainWindow(QMainWindow):
@@ -87,9 +20,13 @@ class MainWindow(QMainWindow):
         self.current_papers = []
         self.active_threads = []  # 跟踪活动线程
         self.analysis_queue = []  # 等待分析的论文队列
-        self.analysis_delay = 5  # 线程间延时（秒）
+        self.analysis_delay = 3  # 线程间延时（秒）
         self.is_analyzing = False  # 是否正在分析
         self.config = "./config.json"
+        self.download_buttons = []  # 存储下载按钮的列表
+        self.download_layout = None  # 用于存储下载按钮的布局引用
+        self.paper_tabs = {}  # 存储论文标签页的字典
+        self.search_in_progress = False  # 添加搜索状态标志
 
         api_key = None
         # 初始化 DeepSeek API
@@ -150,8 +87,8 @@ class MainWindow(QMainWindow):
 
         # 结果数量
         self.results_spin = QSpinBox()
-        self.results_spin.setRange(1, 50)
-        self.results_spin.setValue(10)
+        self.results_spin.setRange(1, 10)
+        self.results_spin.setValue(3)
         advanced_layout.addWidget(QLabel('结果数量:'))
         advanced_layout.addWidget(self.results_spin)
 
@@ -164,10 +101,20 @@ class MainWindow(QMainWindow):
         advanced_layout.addStretch()
         layout.addLayout(advanced_layout)
 
-        # 结果显示区域
-        self.results_text = QTextEdit()
-        self.results_text.setReadOnly(True)
-        layout.addWidget(self.results_text)
+        # 创建水平布局来容纳标签页和下载按钮
+        content_layout = QHBoxLayout()
+
+        # 创建标签页控件
+        self.tab_widget = QTabWidget()
+        content_layout.addWidget(self.tab_widget, stretch=4)
+
+        # 创建下载按钮区域
+        download_widget = QWidget()
+        self.download_layout = QVBoxLayout(download_widget)
+        content_layout.addWidget(download_widget, stretch=1)
+
+        # 将内容布局添加到主布局
+        layout.addLayout(content_layout)
 
         # 下载进度条
         self.progress_bar = QProgressBar()
@@ -179,10 +126,20 @@ class MainWindow(QMainWindow):
 
     def perform_search(self):
         """执行搜索"""
+        if self.search_in_progress:
+            self.statusBar().showMessage('搜索正在进行中，请稍候...')
+            return
+
         query = self.search_input.text()
         if not query:
             self.statusBar().showMessage('请输入搜索关键词')
             return
+
+        # 标记搜索开始
+        self.search_in_progress = True
+
+        # 停止所有活动线程并清理资源
+        self.cleanup_before_search()
 
         # 准备搜索参数
         category = self.category_combo.currentText()
@@ -203,9 +160,6 @@ class MainWindow(QMainWindow):
 
         if category:
             search_params['categories'] = [category]
-
-        # 停止之前的搜索线程
-        self.stop_active_threads()
 
         # 创建并启动新的搜索线程
         self.search_worker = SearchWorker(self.api, search_params)
@@ -230,79 +184,111 @@ class MainWindow(QMainWindow):
 
     def handle_analysis_result(self, result: str, paper_index: int):
         """处理分析结果"""
-        self.clean_finished_threads()
+        try:
+            # 移除已完成的分析请求
+            if self.analysis_queue and self.analysis_queue[0][1] == paper_index:
+                self.analysis_queue.pop(0)
 
-        # 找到对应论文的位置
-        text = self.results_text.toPlainText()
-        paper_sections = text.split("=== 论文 ")
+            # 更新UI
+            if paper_index in self.paper_tabs:
+                paper_tab = self.paper_tabs[paper_index]
+                paper_tab.analysis_text.setPlainText(result.strip())
 
-        if paper_index + 1 >= len(paper_sections):
-            return
+            # 清理已完成的线程
+            self.clean_finished_threads()
 
-        # 更新对应论文的文本
-        current_section = paper_sections[paper_index + 1]
-        current_section = current_section.replace("等待分析...", "")
-        current_section = current_section.replace("正在分析论文...", "")
-        current_section += f"DeepSeek 分析:\n{result.strip()}\n\n"
+        finally:
+            # 重置分析状态
+            self.is_analyzing = False
 
-        # 重建完整文本
-        paper_sections[paper_index + 1] = current_section
-        full_text = "=== 论文 ".join(paper_sections)
-        self.results_text.setPlainText(full_text)
-
-        # 标记当前分析完成
-        self.is_analyzing = False
-
-        # 继续处理队列中的下一篇论文
-        if self.analysis_queue:
-            QTimer.singleShot(self.analysis_delay * 1000, self.process_analysis_queue)
+            # 如果队列中还有论文,设置定时器处理下一个
+            if self.analysis_queue:
+                QTimer.singleShot(self.analysis_delay * 1000, self.process_analysis_queue)
 
     def handle_search_results(self, papers):
         """处理搜索结果"""
-        self.clean_finished_threads()
-        self.current_papers = papers
-        self.results_text.clear()
-        self.analysis_queue.clear()  # 清空之前的分析队列
+        try:
+            self.clean_finished_threads()
+            self.current_papers = papers
 
-        if not papers:
-            self.results_text.append('未找到相关论文')
-            self.statusBar().showMessage('搜索完成: 未找到结果')
-            return
+            if not papers:
+                # 显示无结果的标签页
+                no_results = QWidget()
+                layout = QVBoxLayout(no_results)
+                layout.addWidget(QLabel('未找到相关论文'))
+                self.tab_widget.addTab(no_results, '搜索结果')
+                self.statusBar().showMessage('搜索完成: 未找到结果')
+                return
 
-        for i, paper in enumerate(papers, 1):
-            self.results_text.append(f"=== 论文 {i} ===")
-            self.results_text.append(f"标题: {paper.title}")
-            self.results_text.append(f"作者: {', '.join(paper.authors)}")
-            self.results_text.append(f"摘要: {paper.abstract[:300]}...")
-            self.results_text.append(f"分类: {', '.join(paper.categories)}")
-            self.results_text.append(f"发布日期: {paper.published_date}")
-            self.results_text.append(f"arXiv ID: {paper.paper_id}")
-            self.results_text.append(f"PDF链接: {paper.pdf_url}")
-            self.results_text.append(f"arXiv链接: {paper.arxiv_url}")
+            # 为每篇论文创建标签页
+            for i, paper in enumerate(papers, 1):
+                # 创建论文标签页
+                paper_tab = PaperTab(paper)
+                tab_title = f"论文 {i}: {paper.title[:20]}..."
+                self.tab_widget.addTab(paper_tab, tab_title)
+                self.paper_tabs[i-1] = paper_tab
 
-            # 将论文添加到分析队列
-            if self.deepseek:
-                self.analysis_queue.append((paper, i - 1))
-                self.results_text.append("等待分析...")
+                # 创建下载按钮
+                download_btn = QPushButton(f'下载论文 {i}')
+                download_btn.setFixedWidth(100)
+                download_btn.clicked.connect(lambda checked, p=paper: self.download_paper(p))
+                self.download_buttons.append(download_btn)
+                self.download_layout.addWidget(download_btn)
 
-        self.statusBar().showMessage(f'搜索完成: 找到 {len(papers)} 篇论文')
+                # 将论文添加到分析队列
+                if self.deepseek:
+                    self.analysis_queue.append((paper, i - 1))
 
-        # 开始处理分析队列
-        if self.deepseek and not self.is_analyzing:
-            self.process_analysis_queue()
+            # 添加弹性空间到下载按钮布局底部
+            self.download_layout.addStretch()
+
+            self.statusBar().showMessage(f'搜索完成: 找到 {len(papers)} 篇论文')
+
+            # 开始处理分析队列
+            if self.deepseek and not self.is_analyzing:
+                QTimer.singleShot(100, self.process_analysis_queue)
+
+        finally:
+            # 重置搜索状态
+            self.search_in_progress = False
 
     def process_analysis_queue(self):
         """处理分析队列"""
+        # 如果已经在分析或队列为空,直接返回
         if not self.analysis_queue or self.is_analyzing:
             return
 
+        # 设置分析状态
         self.is_analyzing = True
-        paper, index = self.analysis_queue.pop(0)
-        self.analyze_paper(paper, index)
 
-        # 如果队列中还有论文，设置定时器处理下一个
-        if self.analysis_queue:
-            QTimer.singleShot(self.analysis_delay * 1000, self.process_analysis_queue)
+        try:
+            paper, index = self.analysis_queue[0]  # 只查看队列头部,暂时不移除
+
+            # 确保索引有效且UI组件存在
+            if index not in self.paper_tabs:
+                self.analysis_queue.pop(0)  # 移除无效的分析请求
+                self.is_analyzing = False
+                return
+
+            # 更新UI显示分析状态
+            paper_tab = self.paper_tabs[index]
+            paper_tab.analysis_text.setPlainText("正在分析论文...")
+
+            # 创建并配置分析线程
+            analysis_worker = AnalysisWorker(self.deepseek, paper.abstract, index)
+            analysis_worker.finished.connect(self.handle_analysis_result)
+            analysis_worker.error.connect(self.handle_analysis_error)
+
+            # 将线程添加到活动线程列表
+            self.active_threads.append(analysis_worker)
+
+            # 启动线程
+            analysis_worker.start()
+
+        except Exception as e:
+            # 发生错误时确保状态被重置
+            self.is_analyzing = False
+            self.statusBar().showMessage(f'分析过程出错: {str(e)}')
 
     def handle_error(self, error_msg):
         """处理错误"""
@@ -311,6 +297,23 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage(f'发生错误: {error_msg}')
         QMessageBox.warning(self, "错误", f"处理过程中出现错误：{error_msg}")
+
+    def handle_analysis_error(self, error_msg: str):
+        """处理分析错误"""
+        try:
+            # 移除导致错误的分析请求
+            if self.analysis_queue:
+                self.analysis_queue.pop(0)
+
+            self.statusBar().showMessage(f'分析出错: {error_msg}')
+
+        finally:
+            # 重置分析状态
+            self.is_analyzing = False
+
+            # 尝试处理队列中的下一个请求
+            if self.analysis_queue:
+                QTimer.singleShot(self.analysis_delay * 1000, self.process_analysis_queue)
 
     def download_paper(self, paper):
         """下载论文"""
@@ -355,6 +358,42 @@ class MainWindow(QMainWindow):
             if thread.isRunning():
                 thread.wait()
         self.active_threads.clear()
+
+    def cleanup_before_search(self):
+        """在开始新搜索前清理资源"""
+        # 确保所有分析线程都被正确停止
+        for thread in self.active_threads:
+            if isinstance(thread, AnalysisWorker):
+                thread.stop()
+
+        # 等待所有线程完成
+        for thread in self.active_threads:
+            if thread.isRunning():
+                thread.wait()
+
+        # 清空线程列表
+        self.active_threads.clear()
+
+        # 清空分析队列
+        self.analysis_queue.clear()
+
+        # 重置分析状态
+        self.is_analyzing = False
+
+        # 清理UI元素
+        self.tab_widget.clear()
+        self.paper_tabs.clear()
+
+        # 清理下载按钮
+        for btn in self.download_buttons:
+            btn.deleteLater()
+        self.download_buttons.clear()
+
+        if self.download_layout:
+            while self.download_layout.count():
+                item = self.download_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
 
     def clean_finished_threads(self):
         """清理已完成的线程"""
